@@ -324,6 +324,19 @@ export default async function handler(req, res) {
     const acddOrders = [];
     const manualReview = [];
 
+    // Track which suppliers each order needs, so we can build the Shipment Tracking tab.
+    // Only Asmodee/Universal Dist/ACDD count here - "Needs Manual Review" items aren't
+    // tied to a real supplier shipment, so they're intentionally excluded from this map.
+    const orderSupplierNeeds = new Map(); // orderName -> Set of supplier labels
+
+    function recordSupplierNeed(orderNamesStr, supplierLabel) {
+      const names = orderNamesStr.split(', ').filter(Boolean);
+      for (const name of names) {
+        if (!orderSupplierNeeds.has(name)) orderSupplierNeeds.set(name, new Set());
+        orderSupplierNeeds.get(name).add(supplierLabel);
+      }
+    }
+
     for (const [sku, entry] of aggregated.entries()) {
       const orderNamesStr = [...new Set(entry.orderNames)].join(', ');
 
@@ -338,13 +351,23 @@ export default async function handler(req, res) {
 
       if (decision.supplier === 'asmodee') {
         asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, '']);
+        recordSupplierNeed(orderNamesStr, 'Asmodee');
       } else if (decision.supplier === 'universal_dist') {
         universalOrders.push([sku, entry.totalQty, entry.title, decision.warehouse, orderNamesStr, '', '']);
+        recordSupplierNeed(orderNamesStr, 'Universal Dist');
       } else if (decision.supplier === 'acdd') {
         acddOrders.push([decision.acddSku, sku, entry.totalQty, entry.title, orderNamesStr, decision.reason || '']);
+        recordSupplierNeed(orderNamesStr, 'ACDD');
       } else {
         manualReview.push([sku, entry.title, entry.totalQty, orderNamesStr, decision.reason, '']);
       }
+    }
+
+    // Build Shipment Tracking rows: one per order that needs at least one real supplier shipment
+    const shipmentTrackingRows = [];
+    for (const [orderName, suppliers] of orderSupplierNeeds.entries()) {
+      const suppliersNeeded = [...suppliers].sort().join(', ');
+      shipmentTrackingRows.push([orderName, suppliersNeeded, '', 'Pending']);
     }
 
     // Clear and write each tab
@@ -353,12 +376,14 @@ export default async function handler(req, res) {
     await sheetsClear(AGG_SHEET_ID, 'Universal Dist Order!A2:G1000');
     await sheetsClear(AGG_SHEET_ID, 'ACDD Order!A2:F1000');
     await sheetsClear(AGG_SHEET_ID, 'Needs Manual Review!A2:F1000');
+    await sheetsClear(AGG_SHEET_ID, "'Shipment Tracking'!A2:D1000");
 
     if (alreadyInBins.length) await sheetsPut(AGG_SHEET_ID, `Already In Bins!A2:F${alreadyInBins.length + 1}`, alreadyInBins);
     if (asmodeeOrders.length) await sheetsPut(AGG_SHEET_ID, `Asmodee Order!A2:H${asmodeeOrders.length + 1}`, asmodeeOrders);
     if (universalOrders.length) await sheetsPut(AGG_SHEET_ID, `Universal Dist Order!A2:G${universalOrders.length + 1}`, universalOrders);
     if (acddOrders.length) await sheetsPut(AGG_SHEET_ID, `ACDD Order!A2:F${acddOrders.length + 1}`, acddOrders);
     if (manualReview.length) await sheetsPut(AGG_SHEET_ID, `Needs Manual Review!A2:F${manualReview.length + 1}`, manualReview);
+    if (shipmentTrackingRows.length) await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:D${shipmentTrackingRows.length + 1}`, shipmentTrackingRows);
 
     return res.status(200).json({
       success: true,
@@ -369,6 +394,7 @@ export default async function handler(req, res) {
       universalDist: universalOrders.length,
       acdd: acddOrders.length,
       needsManualReview: manualReview.length,
+      shipmentTrackingRows: shipmentTrackingRows.length,
     });
 
   } catch (err) {
