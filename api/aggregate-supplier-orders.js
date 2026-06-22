@@ -115,6 +115,58 @@ async function sheetsClear(spreadsheetId, range) {
   if (!res.ok) throw new Error(`Sheets clear failed: ${res.status} ${await res.text()}`);
 }
 
+// Sheet IDs (numeric, not titles) needed for the batchUpdate formatting API.
+// These are stable as long as the tabs aren't deleted/recreated.
+const TAB_SHEET_IDS = {
+  'Asmodee Order': 485680112,
+  'Universal Dist Order': 1904437783,
+  'ACDD Order': 1604429882,
+};
+
+const BIN_HIGHLIGHT_COLOR = { red: 0.85, green: 0.95, blue: 0.85 }; // light green
+
+async function applyRowFormatting(spreadsheetId, requests) {
+  if (!requests.length) return;
+  const token = await getGoogleToken(false);
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests }),
+    }
+  );
+  if (!res.ok) throw new Error(`Sheets batchUpdate (formatting) failed: ${res.status} ${await res.text()}`);
+}
+
+function buildHighlightRequests(tabName, rowIndices, numColumns) {
+  const sheetId = TAB_SHEET_IDS[tabName];
+  if (!sheetId) return [];
+
+  // First, clear formatting for the whole data range (rows 2 through 1000) so
+  // last week's highlights don't linger on rows that no longer qualify.
+  const requests = [{
+    repeatCell: {
+      range: { sheetId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 0, endColumnIndex: numColumns },
+      cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+      fields: 'userEnteredFormat.backgroundColor',
+    }
+  }];
+
+  // rowIndices are 0-based within the data rows (row 2 in the sheet = index 0)
+  for (const idx of rowIndices) {
+    const sheetRow = idx + 1; // +1 because row 0 is the header row
+    requests.push({
+      repeatCell: {
+        range: { sheetId, startRowIndex: sheetRow, endRowIndex: sheetRow + 1, startColumnIndex: 0, endColumnIndex: numColumns },
+        cell: { userEnteredFormat: { backgroundColor: BIN_HIGHLIGHT_COLOR } },
+        fields: 'userEnteredFormat.backgroundColor',
+      }
+    });
+  }
+  return requests;
+}
+
 // ── Build lookup maps from Sheet1, APS - US Only, Universal Dist export, Garland ──
 function rowsToObjects(rows) {
   const [header, ...rest] = rows;
@@ -337,26 +389,35 @@ export default async function handler(req, res) {
       }
     }
 
+    // Track which row indices (0-based, within each tab's own data rows) need the
+    // "also in bins" green highlight, so we can apply formatting after writing values.
+    const binHighlightRows = { asmodee: [], universal: [], acdd: [] };
+
     for (const [sku, entry] of aggregated.entries()) {
       const orderNamesStr = [...new Set(entry.orderNames)].join(', ');
 
       // Check bins first - advisory only, doesn't stop supplier evaluation
       const binMatches = entry.productId ? binLookup.get(entry.productId) : null;
+      let binNoteStr = '';
       if (binMatches && binMatches.length > 0) {
         const binLocStr = binMatches.map(b => `${b.binKey}(${b.quantity})`).join(', ');
         alreadyInBins.push([sku, entry.title, entry.totalQty, binLocStr, orderNamesStr, '']);
+        binNoteStr = `Also in bins: ${binLocStr}`;
       }
 
       const decision = decideSupplier(sku, entry.title, sheetData);
 
       if (decision.supplier === 'asmodee') {
-        asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, '']);
+        if (binNoteStr) binHighlightRows.asmodee.push(asmodeeOrders.length);
+        asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, binNoteStr]);
         recordSupplierNeed(orderNamesStr, 'Asmodee');
       } else if (decision.supplier === 'universal_dist') {
-        universalOrders.push([sku, entry.totalQty, entry.title, decision.warehouse, orderNamesStr, '', '']);
+        if (binNoteStr) binHighlightRows.universal.push(universalOrders.length);
+        universalOrders.push([sku, entry.totalQty, entry.title, decision.warehouse, orderNamesStr, binNoteStr, '']);
         recordSupplierNeed(orderNamesStr, 'Universal Dist');
       } else if (decision.supplier === 'acdd') {
-        acddOrders.push([decision.acddSku, sku, entry.totalQty, entry.title, orderNamesStr, decision.reason || '']);
+        if (binNoteStr) binHighlightRows.acdd.push(acddOrders.length);
+        acddOrders.push([decision.acddSku, sku, entry.totalQty, entry.title, orderNamesStr, binNoteStr]);
         recordSupplierNeed(orderNamesStr, 'ACDD');
       } else {
         manualReview.push([sku, entry.title, entry.totalQty, orderNamesStr, decision.reason, '']);
@@ -369,6 +430,7 @@ export default async function handler(req, res) {
       const suppliersNeeded = [...suppliers].sort().join(', ');
       shipmentTrackingRows.push([orderName, suppliersNeeded, '', 'Pending']);
     }
+
 
     // Clear and write each tab
     await sheetsClear(AGG_SHEET_ID, 'Already In Bins!A2:F1000');
@@ -384,6 +446,14 @@ export default async function handler(req, res) {
     if (acddOrders.length) await sheetsPut(AGG_SHEET_ID, `ACDD Order!A2:F${acddOrders.length + 1}`, acddOrders);
     if (manualReview.length) await sheetsPut(AGG_SHEET_ID, `Needs Manual Review!A2:F${manualReview.length + 1}`, manualReview);
     if (shipmentTrackingRows.length) await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:D${shipmentTrackingRows.length + 1}`, shipmentTrackingRows);
+
+    // Highlight rows on the supplier tabs that also have bin stock available
+    const formattingRequests = [
+      ...buildHighlightRequests('Asmodee Order', binHighlightRows.asmodee, 8),
+      ...buildHighlightRequests('Universal Dist Order', binHighlightRows.universal, 7),
+      ...buildHighlightRequests('ACDD Order', binHighlightRows.acdd, 6),
+    ];
+    await applyRowFormatting(AGG_SHEET_ID, formattingRequests);
 
     return res.status(200).json({
       success: true,
