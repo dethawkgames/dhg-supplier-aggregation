@@ -121,6 +121,7 @@ const TAB_SHEET_IDS = {
   'Asmodee Order': 485680112,
   'Universal Dist Order': 1904437783,
   'ACDD Order': 1604429882,
+  'Asmodee - Checkout': 1415624207,
 };
 
 const BIN_HIGHLIGHT_COLOR = { red: 0.85, green: 0.95, blue: 0.85 }; // light green
@@ -392,7 +393,7 @@ export default async function handler(req, res) {
 
     // Track which row indices (0-based, within each tab's own data rows) need the
     // "also in bins" green highlight, so we can apply formatting after writing values.
-    const binHighlightRows = { asmodee: [], universal: [], acdd: [] };
+    const binHighlightRows = { asmodee: [], universal: [], acdd: [], checkout: [] };
 
     for (const [sku, entry] of aggregated.entries()) {
       const orderNamesStr = [...new Set(entry.orderNames)].join(', ');
@@ -409,7 +410,10 @@ export default async function handler(req, res) {
       const decision = decideSupplier(sku, entry.title, sheetData);
 
       if (decision.supplier === 'asmodee') {
-        if (binNoteStr) binHighlightRows.asmodee.push(asmodeeOrders.length);
+        if (binNoteStr) {
+          binHighlightRows.asmodee.push(asmodeeOrders.length);
+          binHighlightRows.checkout.push(checkoutRows.length);
+        }
         asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, binNoteStr]);
         checkoutRows.push([sku, entry.totalQty, 'Each', '']);
         recordSupplierNeed(orderNamesStr, 'Asmodee');
@@ -461,6 +465,7 @@ export default async function handler(req, res) {
       ...buildHighlightRequests('Asmodee Order', binHighlightRows.asmodee, 8),
       ...buildHighlightRequests('Universal Dist Order', binHighlightRows.universal, 7),
       ...buildHighlightRequests('ACDD Order', binHighlightRows.acdd, 6),
+      ...buildHighlightRequests('Asmodee - Checkout', binHighlightRows.checkout, 4),
     ];
     await applyRowFormatting(AGG_SHEET_ID, formattingRequests);
 
