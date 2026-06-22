@@ -434,7 +434,7 @@ export default async function handler(req, res) {
     const shipmentTrackingRows = [];
     for (const [orderName, suppliers] of orderSupplierNeeds.entries()) {
       const suppliersNeeded = [...suppliers].sort().join(', ');
-      shipmentTrackingRows.push([orderName, suppliersNeeded, '', 'Pending']);
+      shipmentTrackingRows.push([orderName, suppliersNeeded, '', '', '', 'Pending Order']);
     }
 
 
@@ -444,14 +444,14 @@ export default async function handler(req, res) {
     await sheetsClear(AGG_SHEET_ID, 'Universal Dist Order!A2:G1000');
     await sheetsClear(AGG_SHEET_ID, 'ACDD Order!A2:F1000');
     await sheetsClear(AGG_SHEET_ID, 'Needs Manual Review!A2:F1000');
-    await sheetsClear(AGG_SHEET_ID, "'Shipment Tracking'!A2:D1000");
+    await sheetsClear(AGG_SHEET_ID, "'Shipment Tracking'!A2:F1000");
 
     if (alreadyInBins.length) await sheetsPut(AGG_SHEET_ID, `Already In Bins!A2:F${alreadyInBins.length + 1}`, alreadyInBins);
     if (asmodeeOrders.length) await sheetsPut(AGG_SHEET_ID, `Asmodee Order!A2:H${asmodeeOrders.length + 1}`, asmodeeOrders);
     if (universalOrders.length) await sheetsPut(AGG_SHEET_ID, `Universal Dist Order!A2:G${universalOrders.length + 1}`, universalOrders);
     if (acddOrders.length) await sheetsPut(AGG_SHEET_ID, `ACDD Order!A2:F${acddOrders.length + 1}`, acddOrders);
     if (manualReview.length) await sheetsPut(AGG_SHEET_ID, `Needs Manual Review!A2:F${manualReview.length + 1}`, manualReview);
-    if (shipmentTrackingRows.length) await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:D${shipmentTrackingRows.length + 1}`, shipmentTrackingRows);
+    if (shipmentTrackingRows.length) await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:F${shipmentTrackingRows.length + 1}`, shipmentTrackingRows);
 
     // Asmodee - Checkout: stripped-down mirror with ONLY the 4 columns their
     // checkout CSV upload tool accepts, with header row matching their sample format
