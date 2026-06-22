@@ -372,6 +372,7 @@ export default async function handler(req, res) {
 
     const alreadyInBins = [];
     const asmodeeOrders = [];
+    const checkoutRows = []; // stripped-down mirror of asmodeeOrders: just the 4 columns Asmodee's checkout upload tool accepts
     const universalOrders = [];
     const acddOrders = [];
     const manualReview = [];
@@ -410,6 +411,7 @@ export default async function handler(req, res) {
       if (decision.supplier === 'asmodee') {
         if (binNoteStr) binHighlightRows.asmodee.push(asmodeeOrders.length);
         asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, binNoteStr]);
+        checkoutRows.push([sku, entry.totalQty, 'Each', '']);
         recordSupplierNeed(orderNamesStr, 'Asmodee');
       } else if (decision.supplier === 'universal_dist') {
         if (binNoteStr) binHighlightRows.universal.push(universalOrders.length);
@@ -447,6 +449,13 @@ export default async function handler(req, res) {
     if (manualReview.length) await sheetsPut(AGG_SHEET_ID, `Needs Manual Review!A2:F${manualReview.length + 1}`, manualReview);
     if (shipmentTrackingRows.length) await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:D${shipmentTrackingRows.length + 1}`, shipmentTrackingRows);
 
+    // Asmodee - Checkout: stripped-down mirror with ONLY the 4 columns their
+    // checkout CSV upload tool accepts, with header row matching their sample format
+    await sheetsClear(AGG_SHEET_ID, "'Asmodee - Checkout'!A1:D1000");
+    const checkoutHeader = [['ProductId', 'Quantity', 'UnitOfMeasureId', 'VariantId']];
+    await sheetsPut(AGG_SHEET_ID, `'Asmodee - Checkout'!A1:D1`, checkoutHeader);
+    if (checkoutRows.length) await sheetsPut(AGG_SHEET_ID, `'Asmodee - Checkout'!A2:D${checkoutRows.length + 1}`, checkoutRows);
+
     // Highlight rows on the supplier tabs that also have bin stock available
     const formattingRequests = [
       ...buildHighlightRequests('Asmodee Order', binHighlightRows.asmodee, 8),
@@ -464,6 +473,7 @@ export default async function handler(req, res) {
       universalDist: universalOrders.length,
       acdd: acddOrders.length,
       needsManualReview: manualReview.length,
+      asmodeeCheckoutRows: checkoutRows.length,
       shipmentTrackingRows: shipmentTrackingRows.length,
     });
 
