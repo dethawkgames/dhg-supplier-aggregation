@@ -423,8 +423,8 @@ export default async function handler(req, res) {
     // Clear and write each tab
     await sheetsClear(AGG_SHEET_ID, 'Already In Bins!A2:F1000');
     await sheetsClear(AGG_SHEET_ID, 'Asmodee Order!A2:H1000');
-    await sheetsClear(AGG_SHEET_ID, 'Universal Dist Order!A2:G1000');
-    await sheetsClear(AGG_SHEET_ID, 'ACDD Order!A2:F1000');
+    await sheetsClear(AGG_SHEET_ID, 'Universal Dist Order!A2:H1000');
+    await sheetsClear(AGG_SHEET_ID, 'ACDD Order!A2:G1000');
     await sheetsClear(AGG_SHEET_ID, 'Needs Manual Review!A2:F1000');
 
     if (alreadyInBins.length) await sheetsPut(AGG_SHEET_ID, `Already In Bins!A2:F${alreadyInBins.length + 1}`, alreadyInBins);
