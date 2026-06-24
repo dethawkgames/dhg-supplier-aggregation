@@ -309,6 +309,30 @@ function buildBinLookup(bins) {
   return byProductId;
 }
 
+// ── Newly Available Backorders (written by the Sunday night Backorder Sweep) ─
+// These orders are often well past the 7-day window above, so they need to be
+// folded in separately rather than relying on the normal order scan to catch
+// them. Cleared after being read so the same row isn't picked up again next
+// Monday.
+const BACKORDER_TAB = 'Newly Available Backorders';
+
+async function getAndClearNewlyAvailableBackorders() {
+  const rows = await sheetsGet(AGG_SHEET_ID, `'${BACKORDER_TAB}'!A2:E1000`).catch(() => []);
+  const filtered = rows.filter(r => r.length && r[0]);
+  if (filtered.length) {
+    await sheetsClear(AGG_SHEET_ID, `'${BACKORDER_TAB}'!A2:E1000`);
+  }
+  // Columns: Order, SKU, Quantity, Title, Supplier (Supplier is informational
+  // only - this script re-runs decideSupplier itself below so routing stays
+  // consistent with current data rather than trusting a day-old snapshot).
+  return filtered.map(r => ({
+    orderName: r[0],
+    sku: r[1]?.trim(),
+    quantity: parseInt(r[2], 10) || 0,
+    title: r[3] || '',
+  }));
+}
+
 // ── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   const auth = req.headers['authorization'];
@@ -317,10 +341,11 @@ export default async function handler(req, res) {
   }
 
   try {
-    const [orders, sheetData, bins] = await Promise.all([
+    const [orders, sheetData, bins, backorderRows] = await Promise.all([
       getRecentUnfulfilledOrders(),
       loadSupplierData(),
       getBinData(),
+      getAndClearNewlyAvailableBackorders(),
     ]);
 
     const binLookup = buildBinLookup(bins);
@@ -347,6 +372,21 @@ export default async function handler(req, res) {
         entry.orderNames.push(order.name);
       }
     }
+
+    // Merge in newly-available backorders from the Sunday sweep. No
+    // productId is available here, so these items won't show up in the
+    // "Already In Bins" advisory list, but routing still runs through the
+    // same decision tree below.
+    for (const b of backorderRows) {
+      if (!b.sku) continue;
+      if (!aggregated.has(b.sku)) {
+        aggregated.set(b.sku, { title: b.title, productId: null, totalQty: 0, orderNames: [] });
+      }
+      const entry = aggregated.get(b.sku);
+      entry.totalQty += b.quantity;
+      entry.orderNames.push(b.orderName);
+    }
+
 
     const alreadyInBins = [];
     const asmodeeOrders = [];
@@ -394,6 +434,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       success: true,
       ordersScanned: orders.length,
+      backordersMerged: backorderRows.length,
       uniqueSkus: aggregated.size,
       alreadyInBins: alreadyInBins.length,
       asmodee: asmodeeOrders.length,
