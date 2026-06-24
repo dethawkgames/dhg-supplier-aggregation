@@ -182,8 +182,10 @@ async function loadSupplierData() {
     if (variantSku && barcode) udBarcodeBySku.set(variantSku, barcode);
   }
 
-  // Garland (ACDD): row 3 is header
-  const garlandRows = await sheetsGet(SKUS_SHEET_ID, 'Garland!A3:H');
+  // Garland (ACDD): header is row 1 (previously assumed row 3 - the sheet's
+  // layout changed at some point and this lookup had been silently broken,
+  // matching almost nothing for the ACDD fallback path)
+  const garlandRows = await sheetsGet(SKUS_SHEET_ID, 'Garland!A1:H');
   const garlandHeader = garlandRows[0];
   const garlandData = rowsToObjects([garlandHeader, ...garlandRows.slice(1)]);
   const garlandByItemId = new Map();
