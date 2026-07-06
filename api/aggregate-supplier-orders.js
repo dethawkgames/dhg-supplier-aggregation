@@ -1,6 +1,8 @@
 // Supplier Order Aggregation
-// Pulls unfulfilled orders from the last 7 days, cross-references bins,
-// determines correct supplier per item via the decision tree, writes to Google Sheet.
+// Pulls unfulfilled orders since the last confirmed checkpoint (falling back
+// to a rolling 7-day window if no checkpoint is set), cross-references bins,
+// determines correct supplier per item via the decision tree, writes to
+// Google Sheet.
 
 import jwt from 'jsonwebtoken';
 
@@ -12,6 +14,16 @@ const BIN_TRACKER_URL = 'https://dhg-bin-tracker-app.vercel.app';
 
 const SKUS_SHEET_ID = '1yC-oZ-0hD5ReTcOA9iTjTGC6mONbDUCpfbZZA9GrQtI';
 const AGG_SHEET_ID = '1rsUU7qZJZGhivsofBiFPa7FK6qnHosrxps10NYzLxAE';
+
+// ── Cron Config tab ──────────────────────────────────────────────────────────
+// A2 = "Last Order Included" (label, informational)      B2 = order name, e.g. "#5401"
+// This is a MANUAL checkpoint - Iain updates B2 himself after actually placing
+// an order with a supplier each week. The cron never writes this cell itself;
+// it only reads it, so there's no risk of the cron silently advancing past an
+// order that didn't actually get placed. If B2 is empty (first run, or after
+// a reset), the scan falls back to the legacy rolling 7-day window.
+const CONFIG_TAB = 'Cron Config';
+const CONFIG_CHECKPOINT_CELL = `'${CONFIG_TAB}'!B2`;
 
 const GOOGLE_SA_EMAIL_VAR = () => process.env.GOOGLE_SA_EMAIL;
 const GOOGLE_SA_PRIVATE_KEY_VAR = () => (process.env.GOOGLE_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
@@ -113,6 +125,29 @@ async function sheetsClear(spreadsheetId, range) {
     { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } }
   );
   if (!res.ok) throw new Error(`Sheets clear failed: ${res.status} ${await res.text()}`);
+}
+
+async function ensureConfigTabExists() {
+  const token = await getGoogleToken(false);
+  const metaRes = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}?fields=sheets.properties.title`,
+    { headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  const meta = await metaRes.json();
+  const titles = meta.sheets.map(s => s.properties.title);
+  if (titles.includes(CONFIG_TAB)) return;
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: [{ addSheet: { properties: { title: CONFIG_TAB } } }] }),
+    }
+  );
+  await sheetsPut(AGG_SHEET_ID, `'${CONFIG_TAB}'!A1:B2`, [
+    ['Setting', 'Value'],
+    ['Last Order Included', ''],
+  ]);
 }
 
 // ── Build lookup maps from Sheet1, APS - US Only, Universal Dist export, Garland ──
@@ -256,22 +291,64 @@ function decideSupplier(sku, title, sheetData) {
   return { supplier: 'manual_review', reason: 'No Asmodee or Alliance tag found' };
 }
 
-// ── Pull unfulfilled orders from last 7 days ────────────────────────────────
-async function getRecentUnfulfilledOrders() {
+// ── Determine the scan window: checkpoint order (preferred) or rolling 7-day ──
+
+async function getOrderCreatedAt(orderName) {
+  const cleanName = orderName.trim().replace(/^#/, '');
+  const data = await shopifyGraphql(`
+    query getOrder($q: String!) {
+      orders(first: 1, query: $q) { edges { node { name createdAt } } }
+    }
+  `, { q: `name:${cleanName}` });
+  const edge = data.orders.edges[0];
+  return edge ? edge.node.createdAt : null;
+}
+
+async function getScanWindow() {
+  await ensureConfigTabExists();
+  const rows = await sheetsGet(AGG_SHEET_ID, CONFIG_CHECKPOINT_CELL).catch(() => []);
+  const checkpointOrder = rows?.[0]?.[0]?.trim();
+
+  if (checkpointOrder) {
+    const createdAt = await getOrderCreatedAt(checkpointOrder);
+    if (createdAt) {
+      return {
+        mode: 'checkpoint',
+        checkpointOrder,
+        // Strictly after the checkpoint order's own timestamp, so it isn't
+        // re-included alongside whatever's genuinely new since then.
+        query: `fulfillment_status:unfulfilled -status:cancelled created_at:>${createdAt}`,
+      };
+    }
+    // Checkpoint order couldn't be found (typo, or the order was deleted) -
+    // fall back rather than silently scanning nothing or erroring the whole run.
+    console.warn(`Checkpoint order "${checkpointOrder}" not found in Shopify - falling back to rolling 7-day window.`);
+  }
+
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  return {
+    mode: 'rolling-7-day',
+    checkpointOrder: null,
+    query: `fulfillment_status:unfulfilled -status:cancelled created_at:>=${sevenDaysAgo}`,
+  };
+}
+
+// ── Pull unfulfilled orders since the scan window's cutoff ──────────────────
+async function getRecentUnfulfilledOrders(scanWindow) {
   const allOrders = [];
   let cursor = null;
   let hasNextPage = true;
 
   while (hasNextPage) {
     const data = await shopifyGraphql(`
-      query getOrders($cursor: String) {
-        orders(first: 50, after: $cursor, query: "fulfillment_status:unfulfilled created_at:>=${sevenDaysAgo}") {
+      query getOrders($cursor: String, $query: String!) {
+        orders(first: 50, after: $cursor, query: $query) {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
               id
               name
+              createdAt
               tags
               lineItems(first: 50) {
                 edges {
@@ -287,7 +364,7 @@ async function getRecentUnfulfilledOrders() {
           }
         }
       }
-    `, { cursor });
+    `, { cursor, query: scanWindow.query });
 
     for (const edge of data.orders.edges) {
       allOrders.push(edge.node);
@@ -319,7 +396,7 @@ function buildBinLookup(bins) {
 }
 
 // ── Newly Available Backorders (written by the Sunday night Backorder Sweep) ─
-// These orders are often well past the 7-day window above, so they need to be
+// These orders are often well past the scan window above, so they need to be
 // folded in separately rather than relying on the normal order scan to catch
 // them. Cleared after being read so the same row isn't picked up again next
 // Monday.
@@ -350,8 +427,10 @@ export default async function handler(req, res) {
   }
 
   try {
+    const scanWindow = await getScanWindow();
+
     const [orders, sheetData, bins, backorderRows] = await Promise.all([
-      getRecentUnfulfilledOrders(),
+      getRecentUnfulfilledOrders(scanWindow),
       loadSupplierData(),
       getBinData(),
       getAndClearNewlyAvailableBackorders(),
@@ -440,8 +519,17 @@ export default async function handler(req, res) {
     if (acddOrders.length) await sheetsPut(AGG_SHEET_ID, `ACDD Order!A2:F${acddOrders.length + 1}`, acddOrders);
     if (manualReview.length) await sheetsPut(AGG_SHEET_ID, `Needs Manual Review!A2:F${manualReview.length + 1}`, manualReview);
 
+    // Newest order actually scanned this run - NOT written anywhere
+    // automatically. Surfaced here so it's easy to copy into the Cron Config
+    // tab's checkpoint cell after confirming what actually got ordered.
+    const newestOrderThisRun = orders.length
+      ? orders.reduce((latest, o) => (new Date(o.createdAt) > new Date(latest.createdAt) ? o : latest)).name
+      : null;
+
     return res.status(200).json({
       success: true,
+      scanMode: scanWindow.mode,
+      scanCheckpointUsed: scanWindow.checkpointOrder,
       ordersScanned: orders.length,
       backordersMerged: backorderRows.length,
       uniqueSkus: aggregated.size,
@@ -451,6 +539,8 @@ export default async function handler(req, res) {
       acdd: acddOrders.length,
       needsManualReview: manualReview.length,
       universalDistTabUsed: 'Alliance',
+      suggestedNextCheckpoint: newestOrderThisRun,
+      note: `After you actually place this week's supplier order(s), set '${CONFIG_TAB}'!B2 to the last order number you included (e.g. "${newestOrderThisRun || '#5401'}") so next week's scan starts right after it.`,
     });
 
   } catch (err) {
