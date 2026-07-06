@@ -482,6 +482,14 @@ export default async function handler(req, res) {
     const acddOrders = [];
     const manualReview = [];
 
+    // Tracks which suppliers each ORDER (not SKU) actually needs, so we can
+    // create its Shipment Tracking row below. Built from resolved decisions
+    // only - "Already In Bins" items need no supplier at all, and
+    // "manual_review" items have no resolved supplier yet, so neither
+    // contributes to an order's needed-supplier set until resolved.
+    const orderSuppliersNeeded = new Map(); // orderName -> Set of 'Asmodee'|'Universal Dist'|'ACDD'
+    const SUPPLIER_LABELS = { asmodee: 'Asmodee', universal_dist: 'Universal Dist', acdd: 'ACDD' };
+
     for (const [sku, entry] of aggregated.entries()) {
       const orderNamesStr = [...new Set(entry.orderNames)].join(', ');
 
@@ -493,6 +501,13 @@ export default async function handler(req, res) {
       }
 
       const decision = decideSupplier(sku, entry.title, sheetData);
+      const label = SUPPLIER_LABELS[decision.supplier];
+      if (label) {
+        for (const orderName of new Set(entry.orderNames)) {
+          if (!orderSuppliersNeeded.has(orderName)) orderSuppliersNeeded.set(orderName, new Set());
+          orderSuppliersNeeded.get(orderName).add(label);
+        }
+      }
 
       if (decision.supplier === 'asmodee') {
         asmodeeOrders.push([sku, entry.totalQty, 'Each', '', entry.title, decision.stockStatus, orderNamesStr, '']);
@@ -505,6 +520,30 @@ export default async function handler(req, res) {
         manualReview.push([sku, entry.title, entry.totalQty, orderNamesStr, decision.reason, '']);
       }
     }
+
+    // ── Create Shipment Tracking rows for any order that needs a supplier
+    // and doesn't already have one. This is the step that was missing
+    // entirely before - without it, orders aggregated here never show up for
+    // the Ordered/Shipped/Arrived buttons to act on, no matter how many
+    // times those buttons get clicked.
+    const existingTrackingRows = await sheetsGet(AGG_SHEET_ID, "'Shipment Tracking'!A2:F1000");
+    const existingTrackingOrders = new Set(existingTrackingRows.filter(r => r.length && r[0]).map(r => r[0]));
+
+    const newTrackingRows = [];
+    for (const [orderName, suppliers] of orderSuppliersNeeded.entries()) {
+      if (existingTrackingOrders.has(orderName)) continue; // already tracked, don't duplicate or reset progress
+      if (suppliers.size === 0) continue; // shouldn't happen given the loop above, but guard anyway
+      const neededStr = [...suppliers].sort().join(', ');
+      newTrackingRows.push([orderName, neededStr, '', '', '', 'Pending Order']);
+    }
+    if (newTrackingRows.length) {
+      await sheetsPut(
+        AGG_SHEET_ID,
+        `'Shipment Tracking'!A${existingTrackingRows.length + 2}:F${existingTrackingRows.length + 1 + newTrackingRows.length}`,
+        newTrackingRows
+      );
+    }
+
 
     // Clear and write each tab
     await sheetsClear(AGG_SHEET_ID, 'Already In Bins!A2:F1000');
@@ -539,6 +578,8 @@ export default async function handler(req, res) {
       acdd: acddOrders.length,
       needsManualReview: manualReview.length,
       universalDistTabUsed: 'Alliance',
+      shipmentTrackingRowsCreated: newTrackingRows.length,
+      shipmentTrackingRowsCreatedFor: newTrackingRows.map(r => r[0]),
       suggestedNextCheckpoint: newestOrderThisRun,
       note: `After you actually place this week's supplier order(s), set '${CONFIG_TAB}'!B2 to the last order number you included (e.g. "${newestOrderThisRun || '#5401'}") so next week's scan starts right after it.`,
     });
