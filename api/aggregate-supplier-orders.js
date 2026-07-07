@@ -266,7 +266,13 @@ function decideSupplier(sku, title, sheetData) {
   if (hasAsmodee) {
     const asmodeeRow = sheetData.asmodeeByCode.get(sku);
     if (!asmodeeRow) {
-      return tryAcdd('Not found in Asmodee catalog');
+      // Not in this month's release feed - the Asmodee catalog tab only
+      // covers recent monthly release imports, not the full active backlist.
+      // The Tags field on the product is the source of truth for who
+      // supplies this item, so an older active title tagged asmodee still
+      // routes to Asmodee rather than manual review - just flagged as
+      // unverified stock status rather than blocking the order entirely.
+      return { supplier: 'asmodee', stockStatus: 'Not in recent release feed - backlist, verify availability' };
     }
     const status = asmodeeRow['Stock Status'];
     if (ASMODEE_UNAVAILABLE.has(status)) {
