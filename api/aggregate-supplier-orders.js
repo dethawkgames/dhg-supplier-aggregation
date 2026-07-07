@@ -355,6 +355,7 @@ async function getRecentUnfulfilledOrders(scanWindow) {
                   node {
                     title
                     quantity
+                    currentQuantity
                     sku
                     product { id }
                   }
@@ -447,6 +448,14 @@ export default async function handler(req, res) {
         const sku = item.sku?.trim();
         if (!sku) continue;
 
+        // currentQuantity reflects the amount still actually owed after any
+        // refunds/edits - quantity is the original order amount and never
+        // changes. A partially-refunded order (e.g. one item refunded, rest
+        // still active) would otherwise keep aggregating demand for an item
+        // that's genuinely gone, blocking that order from ever reconciling.
+        const qty = item.currentQuantity;
+        if (!qty || qty <= 0) continue;
+
         if (!aggregated.has(sku)) {
           aggregated.set(sku, {
             title: item.title,
@@ -456,7 +465,7 @@ export default async function handler(req, res) {
           });
         }
         const entry = aggregated.get(sku);
-        entry.totalQty += item.quantity;
+        entry.totalQty += qty;
         entry.orderNames.push(order.name);
       }
     }
