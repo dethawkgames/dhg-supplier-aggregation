@@ -1,8 +1,10 @@
 // Supplier Order Aggregation
 // Pulls unfulfilled orders since the last confirmed checkpoint (falling back
-// to a rolling 7-day window if no checkpoint is set), cross-references bins,
-// determines correct supplier per item via the decision tree, writes to
-// Google Sheet.
+// to a rolling 7-day window if no checkpoint is set), PLUS any order already
+// in Shipment Tracking that still needs a supplier but hasn't shipped yet
+// regardless of age (so nothing silently ages out of the pipeline),
+// cross-references bins, determines correct supplier per item via the
+// decision tree, writes to Google Sheet.
 
 import jwt from 'jsonwebtoken';
 
@@ -377,8 +379,57 @@ async function getRecentUnfulfilledOrders(scanWindow) {
   return allOrders;
 }
 
-// ── Bin tracker check ────────────────────────────────────────────────────────
-async function getBinData() {
+// ── Stragglers: orders already in Shipment Tracking that still need a
+// supplier but haven't been marked Shipped yet ──────────────────────────────
+// The checkpoint/date-based scan above only catches orders created since the
+// last confirmed checkpoint - that's correct for catching new orders, but it
+// means an order that entered the pipeline and then didn't get fully shipped
+// within roughly a week silently ages out of every future run and never gets
+// re-submitted for reconciliation. This pulls those orders back in by name,
+// bypassing the date filter entirely, so nothing can get permanently stuck.
+async function getStragglerOrders() {
+  const rows = await sheetsGet(AGG_SHEET_ID, "'Shipment Tracking'!A2:F1000");
+  const stragglerNames = [];
+  for (const row of rows) {
+    if (!row.length || !row[0]) continue;
+    const needed = new Set((row[1] || '').split(',').map(s => s.trim()).filter(Boolean));
+    const shipped = new Set((row[3] || '').split(',').map(s => s.trim()).filter(Boolean));
+    const stillNeeded = [...needed].some(s => !shipped.has(s));
+    if (stillNeeded) stragglerNames.push(row[0]);
+  }
+  if (!stragglerNames.length) return [];
+
+  const cleanNames = stragglerNames.map(n => n.trim().replace(/^#/, ''));
+  const nameQuery = cleanNames.map(n => `name:${n}`).join(' OR ');
+  const data = await shopifyGraphql(`
+    query getStragglers($q: String!) {
+      orders(first: 250, query: $q) {
+        edges {
+          node {
+            id
+            name
+            createdAt
+            tags
+            lineItems(first: 50) {
+              edges {
+                node {
+                  title
+                  quantity
+                  currentQuantity
+                  sku
+                  product { id }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `, { q: nameQuery });
+  return data.orders.edges.map(e => e.node);
+}
+
+
   const res = await fetch(`${BIN_TRACKER_URL}/api/bins`);
   if (!res.ok) throw new Error(`Bin tracker fetch failed: ${res.status}`);
   const data = await res.json();
@@ -430,12 +481,19 @@ export default async function handler(req, res) {
   try {
     const scanWindow = await getScanWindow();
 
-    const [orders, sheetData, bins, backorderRows] = await Promise.all([
+    const [scannedOrders, sheetData, bins, backorderRows, stragglerOrders] = await Promise.all([
       getRecentUnfulfilledOrders(scanWindow),
       loadSupplierData(),
       getBinData(),
       getAndClearNewlyAvailableBackorders(),
+      getStragglerOrders(),
     ]);
+
+    // Merge stragglers in, deduping by name in case an order is somehow
+    // caught by both (e.g. the checkpoint window happens to include it too).
+    const seenOrderNames = new Set(scannedOrders.map(o => o.name));
+    const newStragglers = stragglerOrders.filter(o => !seenOrderNames.has(o.name));
+    const orders = [...scannedOrders, ...newStragglers];
 
     const binLookup = buildBinLookup(bins);
 
@@ -579,6 +637,9 @@ export default async function handler(req, res) {
       scanMode: scanWindow.mode,
       scanCheckpointUsed: scanWindow.checkpointOrder,
       ordersScanned: orders.length,
+      ordersFromDateScan: scannedOrders.length,
+      stragglersReincluded: newStragglers.length,
+      stragglersReincludedFor: newStragglers.map(o => o.name),
       backordersMerged: backorderRows.length,
       uniqueSkus: aggregated.size,
       alreadyInBins: alreadyInBins.length,
