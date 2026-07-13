@@ -435,7 +435,8 @@ async function getStragglerOrders() {
   return data.orders.edges.map(e => e.node);
 }
 
-
+// ── Bin tracker check ────────────────────────────────────────────────────────
+async function getBinData() {
   const res = await fetch(`${BIN_TRACKER_URL}/api/bins`);
   if (!res.ok) throw new Error(`Bin tracker fetch failed: ${res.status}`);
   const data = await res.json();
