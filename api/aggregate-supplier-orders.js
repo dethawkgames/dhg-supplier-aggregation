@@ -403,10 +403,10 @@ async function getStragglerOrders() {
     const stillNeeded = [...needed].some(s => !shipped.has(s));
     if (stillNeeded) stragglerNames.push(row[0]);
   }
-  if (!stragglerNames.length) return [];
+  if (!stragglerNames.length) return { orders: [], candidateNames: [] };
 
   const cleanNames = stragglerNames.map(n => n.trim().replace(/^#/, ''));
-  const nameQuery = cleanNames.map(n => `name:${n}`).join(' OR ');
+  const nameQuery = '(' + cleanNames.map(n => `name:${n}`).join(' OR ') + ') fulfillment_status:unfulfilled -status:cancelled';
   const data = await shopifyGraphql(`
     query getStragglers($q: String!) {
       orders(first: 250, query: $q) {
@@ -432,7 +432,7 @@ async function getStragglerOrders() {
       }
     }
   `, { q: nameQuery });
-  return data.orders.edges.map(e => e.node);
+  return { orders: data.orders.edges.map(e => e.node), candidateNames: stragglerNames };
 }
 
 // ── Bin tracker check ────────────────────────────────────────────────────────
@@ -488,13 +488,33 @@ export default async function handler(req, res) {
   try {
     const scanWindow = await getScanWindow();
 
-    const [scannedOrders, sheetData, bins, backorderRows, stragglerOrders] = await Promise.all([
+    const [scannedOrders, sheetData, bins, backorderRows, stragglerResult] = await Promise.all([
       getRecentUnfulfilledOrders(scanWindow),
       loadSupplierData(),
       getBinData(),
       getAndClearNewlyAvailableBackorders(),
       getStragglerOrders(),
     ]);
+    const { orders: stragglerOrders, candidateNames: stragglerCandidateNames } = stragglerResult;
+
+    // A straggler candidate (still shows as unresolved in Shipment Tracking)
+    // that didn't come back from Shopify means it's no longer an open,
+    // unfulfilled order - it was fulfilled or cancelled through some other
+    // channel since it was last tracked. Silently re-submitting it here
+    // would risk placing a duplicate supplier order for an item that's
+    // already been taken care of, so instead its now-stale Shipment
+    // Tracking row(s) get removed.
+    const foundStragglerNames = new Set(stragglerOrders.map(o => o.name));
+    const resolvedAwayNames = stragglerCandidateNames.filter(n => !foundStragglerNames.has(n));
+    if (resolvedAwayNames.length) {
+      const resolvedAwaySet = new Set(resolvedAwayNames);
+      const trackingRows = await sheetsGet(AGG_SHEET_ID, "'Shipment Tracking'!A2:F1000");
+      const keptRows = trackingRows.filter(row => !(row.length && resolvedAwaySet.has(row[0])));
+      await sheetsClear(AGG_SHEET_ID, "'Shipment Tracking'!A2:F1000");
+      if (keptRows.length) {
+        await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!A2:F${keptRows.length + 1}`, keptRows);
+      }
+    }
 
     // Merge stragglers in, deduping by name in case an order is somehow
     // caught by both (e.g. the checkpoint window happens to include it too).
@@ -647,6 +667,8 @@ export default async function handler(req, res) {
       ordersFromDateScan: scannedOrders.length,
       stragglersReincluded: newStragglers.length,
       stragglersReincludedFor: newStragglers.map(o => o.name),
+      stragglersResolvedAway: resolvedAwayNames.length,
+      stragglersResolvedAwayFor: resolvedAwayNames,
       backordersMerged: backorderRows.length,
       uniqueSkus: aggregated.size,
       alreadyInBins: alreadyInBins.length,
