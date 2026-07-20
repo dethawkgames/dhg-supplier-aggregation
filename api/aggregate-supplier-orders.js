@@ -643,6 +643,50 @@ export default async function handler(req, res) {
       );
     }
 
+    // ── "To Order This Week" tabs: the Asmodee/Universal Dist/ACDD Order
+    // tabs above show every SKU currently needed, including stragglers that
+    // were already placed with the supplier in a prior week and are just
+    // waiting to ship. Re-submitting those would risk a duplicate order.
+    // These three tabs instead show only what genuinely hasn't been ordered
+    // yet - checked per order against Shipment Tracking's "Suppliers Ordered
+    // So Far" column, not just by order number - so it's safe to work
+    // straight from these when actually placing orders with each supplier.
+    const orderedSoFar = new Map(); // orderName -> Set of suppliers already marked Ordered
+    for (const row of existingTrackingRows) {
+      if (!row.length || !row[0]) continue;
+      orderedSoFar.set(row[0], new Set((row[2] || '').split(',').map(s => s.trim()).filter(Boolean)));
+    }
+    // Rows created fresh above start with nothing ordered yet - absence from
+    // orderedSoFar already means "not yet ordered" for every supplier, so
+    // they need no separate entry here.
+    function notYetOrdered(orderNamesStr, supplierLabel) {
+      const names = [...new Set((orderNamesStr || '').split(',').map(s => s.trim()).filter(Boolean))];
+      return names.filter(n => !(orderedSoFar.get(n) || new Set()).has(supplierLabel));
+    }
+
+    const asmodeeToOrder = [];
+    for (const [sku, qty, , , title, , orderNamesStr] of asmodeeOrders) {
+      const pending = notYetOrdered(orderNamesStr, 'Asmodee');
+      if (pending.length) asmodeeToOrder.push([sku, qty, title, pending.join(', ')]);
+    }
+    const udToOrder = [];
+    for (const [sku, , qty, title, warehouse, orderNamesStr] of universalOrders) {
+      const pending = notYetOrdered(orderNamesStr, 'Universal Dist');
+      if (pending.length) udToOrder.push([sku, qty, title, warehouse, pending.join(', ')]);
+    }
+    const acddToOrder = [];
+    for (const [acddSku, shopifySku, qty, title, orderNamesStr] of acddOrders) {
+      const pending = notYetOrdered(orderNamesStr, 'ACDD');
+      if (pending.length) acddToOrder.push([acddSku, shopifySku, qty, title, pending.join(', ')]);
+    }
+
+    await sheetsClear(AGG_SHEET_ID, "'Asmodee - To Order This Week'!A2:D1000");
+    await sheetsClear(AGG_SHEET_ID, "'Universal Dist - To Order This Week'!A2:E1000");
+    await sheetsClear(AGG_SHEET_ID, "'ACDD - To Order This Week'!A2:E1000");
+    if (asmodeeToOrder.length) await sheetsPut(AGG_SHEET_ID, `'Asmodee - To Order This Week'!A2:D${asmodeeToOrder.length + 1}`, asmodeeToOrder);
+    if (udToOrder.length) await sheetsPut(AGG_SHEET_ID, `'Universal Dist - To Order This Week'!A2:E${udToOrder.length + 1}`, udToOrder);
+    if (acddToOrder.length) await sheetsPut(AGG_SHEET_ID, `'ACDD - To Order This Week'!A2:E${acddToOrder.length + 1}`, acddToOrder);
+
 
     // Clear and write each tab
     await sheetsClear(AGG_SHEET_ID, 'Already In Bins!A2:F1000');
@@ -684,6 +728,9 @@ export default async function handler(req, res) {
       universalDistTabUsed: 'Alliance',
       shipmentTrackingRowsCreated: newTrackingRows.length,
       shipmentTrackingRowsCreatedFor: newTrackingRows.map(r => r[0]),
+      asmodeeToOrderThisWeek: asmodeeToOrder.length,
+      universalDistToOrderThisWeek: udToOrder.length,
+      acddToOrderThisWeek: acddToOrder.length,
       suggestedNextCheckpoint: newestOrderThisRun,
       note: `After you actually place this week's supplier order(s), set '${CONFIG_TAB}'!B2 to the last order number you included (e.g. "${newestOrderThisRun || '#5401'}") so next week's scan starts right after it.`,
     });
