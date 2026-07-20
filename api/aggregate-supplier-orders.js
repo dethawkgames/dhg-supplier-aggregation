@@ -629,11 +629,31 @@ export default async function handler(req, res) {
     const existingTrackingOrders = new Set(existingTrackingRows.filter(r => r.length && r[0]).map(r => r[0]));
 
     const newTrackingRows = [];
+    const neededSetUpdates = []; // { rowNum, newNeededStr } for existing rows missing a newly-resolved supplier
     for (const [orderName, suppliers] of orderSuppliersNeeded.entries()) {
-      if (existingTrackingOrders.has(orderName)) continue; // already tracked, don't duplicate or reset progress
       if (suppliers.size === 0) continue; // shouldn't happen given the loop above, but guard anyway
+      if (existingTrackingOrders.has(orderName)) {
+        // Already tracked - but if a SKU on this order was previously
+        // manual_review and has since resolved to a real supplier (e.g. a
+        // catalog/tag fix), that supplier needs adding to this row's
+        // needed set, or it'll never show up as needing to be ordered.
+        // Ordered/Shipped/Arrived progress is left untouched.
+        const rowIdx = existingTrackingRows.findIndex(r => r.length && r[0] === orderName);
+        if (rowIdx === -1) continue;
+        const row = existingTrackingRows[rowIdx];
+        const currentNeeded = new Set((row[1] || '').split(',').map(s => s.trim()).filter(Boolean));
+        const missing = [...suppliers].filter(s => !currentNeeded.has(s));
+        if (missing.length) {
+          const mergedNeeded = [...new Set([...currentNeeded, ...suppliers])].sort().join(', ');
+          neededSetUpdates.push({ rowNum: rowIdx + 2, newNeededStr: mergedNeeded });
+        }
+        continue;
+      }
       const neededStr = [...suppliers].sort().join(', ');
       newTrackingRows.push([orderName, neededStr, '', '', '', 'Pending Order']);
+    }
+    for (const { rowNum, newNeededStr } of neededSetUpdates) {
+      await sheetsPut(AGG_SHEET_ID, `'Shipment Tracking'!B${rowNum}:B${rowNum}`, [[newNeededStr]]);
     }
     if (newTrackingRows.length) {
       await sheetsPut(
@@ -728,6 +748,7 @@ export default async function handler(req, res) {
       universalDistTabUsed: 'Alliance',
       shipmentTrackingRowsCreated: newTrackingRows.length,
       shipmentTrackingRowsCreatedFor: newTrackingRows.map(r => r[0]),
+      shipmentTrackingNeededSetsUpdated: neededSetUpdates.length,
       asmodeeToOrderThisWeek: asmodeeToOrder.length,
       universalDistToOrderThisWeek: udToOrder.length,
       acddToOrderThisWeek: acddToOrder.length,
