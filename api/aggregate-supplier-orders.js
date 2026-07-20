@@ -251,6 +251,7 @@ function decideSupplier(sku, title, sheetData) {
 
   const hasAsmodee = tags.includes('asmodee');
   const hasAlliance = tags.includes('alliance');
+  const hasAcdd = tags.includes('acdd');
 
   function tryAcdd(reason) {
     if (!acddSku || acddSku === '#N/A') {
@@ -293,6 +294,10 @@ function decideSupplier(sku, title, sheetData) {
       }
     }
     return tryAcdd('Out of stock at all Universal Dist warehouses');
+  }
+
+  if (hasAcdd) {
+    return tryAcdd('Tagged acdd');
   }
 
   // No recognized supplier tag at all
